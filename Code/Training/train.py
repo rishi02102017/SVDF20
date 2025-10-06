@@ -12,7 +12,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
-from sklearn.metrics import roc_curve
 from tqdm import tqdm
 from pathlib import Path
 
@@ -21,13 +20,6 @@ from data_loader import get_svdf20_dataloaders
 from src.models.models import get_model
 from utils import create_optimizer, seed_worker, set_seed, str_to_bool, reproducibility
 
-def calculate_eer(y_true, y_score):
-    """Calculate Equal Error Rate"""
-    fpr, tpr, thresholds = roc_curve(y_true, y_score)
-    fnr = 1 - tpr
-    eer_threshold = thresholds[np.nanargmin(np.absolute((fnr - fpr)))]
-    eer = fpr[np.nanargmin(np.absolute((fnr - fpr)))]
-    return eer
 
 def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
     """Train for one epoch"""
@@ -64,8 +56,6 @@ def validate_epoch(model, dataloader, criterion, device):
     total_loss = 0
     correct = 0
     total = 0
-    all_scores = []
-    all_targets = []
     
     with torch.no_grad():
         for data, target, _, _, _ in dataloader:
@@ -78,16 +68,11 @@ def validate_epoch(model, dataloader, criterion, device):
             correct += pred.eq(target.view_as(pred)).sum().item()
             total += target.size(0)
             
-            # Collect scores for EER calculation
-            scores = torch.softmax(output, dim=1)[:, 1].cpu().numpy()
-            all_scores.extend(scores)
-            all_targets.extend(target.cpu().numpy())
     
     accuracy = 100. * correct / total
     avg_loss = total_loss / len(dataloader)
-    eer = calculate_eer(all_targets, all_scores)
     
-    return avg_loss, accuracy, eer
+    return avg_loss, accuracy
 
 def update_args_from_command_line():
     """Update args from command line arguments"""
@@ -159,8 +144,8 @@ def main():
     # Get the actual physical GPU ID from CUDA_VISIBLE_DEVICES
     cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '0')
     physical_gpu_id = cuda_visible.split(',')[0] if cuda_visible else '0'
-    logger.info(f"🎯 Using GPU: {physical_gpu_id} (CUDA_VISIBLE_DEVICES={cuda_visible})")
-    logger.info(f"💾 GPU Memory: {gpu_info['memory_free']/1024**3:.1f}GB free, {gpu_info['memory_allocated']/1024**3:.1f}GB used")
+    logger.info(f" Using GPU: {physical_gpu_id} (CUDA_VISIBLE_DEVICES={cuda_visible})")
+    logger.info(f" GPU Memory: {gpu_info['memory_free']/1024**3:.1f}GB free, {gpu_info['memory_allocated']/1024**3:.1f}GB used")
     logger.info(f"Dataset: {args.dataset_name}")
     logger.info(f"Model: {args.model_name}")
     # Get model-specific batch size
@@ -207,7 +192,7 @@ def main():
         # Setup tensorboard
         writer = SummaryWriter(log_dir)
         
-        best_eer = float('inf')
+        best_acc = 0.0
         best_epoch = 0
         
         logger.info(f"Starting training for {args.num_epochs} epochs")
@@ -220,32 +205,31 @@ def main():
             train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device, epoch)
             
             # Validation
-            val_loss, val_acc, val_eer = validate_epoch(model, dev_loader, criterion, device)
+            val_loss, val_acc = validate_epoch(model, dev_loader, criterion, device)
             
             # Log metrics
             writer.add_scalar('Loss/Train', train_loss, epoch)
             writer.add_scalar('Loss/Val', val_loss, epoch)
             writer.add_scalar('Accuracy/Train', train_acc, epoch)
             writer.add_scalar('Accuracy/Val', val_acc, epoch)
-            writer.add_scalar('EER/Val', val_eer, epoch)
             
             logger.info(f"Epoch {epoch}: Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-            logger.info(f"Epoch {epoch}: Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, Val EER: {val_eer:.4f}")
+            logger.info(f"Epoch {epoch}: Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
             
             # Save best model
-            if val_eer < best_eer:
-                best_eer = val_eer
+            if val_acc > best_acc:
+                best_acc = val_acc
                 best_epoch = epoch
                 torch.save(model.state_dict(), log_dir / 'best_model.pt')
-                logger.info(f"New best model saved with EER: {best_eer:.4f}")
+                logger.info(f"New best model saved with accuracy: {best_acc:.2f}%")
         
         # Save final model
         checkpoint_path = f"{args.output_dir}/{args.model_name}_final.pt"
         torch.save(model.state_dict(), checkpoint_path)
         
         logger.info("=" * 80)
-        logger.info(f"✅ {args.model_name} training completed successfully!")
-        logger.info(f"Best EER: {best_eer:.4f} at epoch {best_epoch}")
+        logger.info(f" {args.model_name} training completed successfully!")
+        logger.info(f"Best accuracy: {best_acc:.2f}% at epoch {best_epoch}")
         logger.info(f"Model saved at: {checkpoint_path}")
         logger.info("=" * 80)
         
@@ -253,7 +237,7 @@ def main():
         return checkpoint_path
         
     except Exception as e:
-        logger.error(f"❌ {args.model_name} training failed: {e}")
+        logger.error(f" {args.model_name} training failed: {e}")
         raise e
 
 if __name__ == "__main__":
